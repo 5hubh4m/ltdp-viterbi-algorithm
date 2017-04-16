@@ -27,3 +27,10 @@
 *.exe
 *.out
 *.app
+
+# Custom
+*.swp
+data
+data/*
+.ycm_extra_conf
+.color_coded
