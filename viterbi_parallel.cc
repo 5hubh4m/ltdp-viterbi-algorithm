@@ -23,11 +23,11 @@ int num_procs, tid, lp, rp;
 
 #pragma omp declare reduction(                                           \
         max_argmax                                                       \
-      : std::pair<double, int>                                           \
-      : omp_out = (omp_in.first > omp_out.first ? omp_out : omp_in))     \
-        initializer (omp_priv =                                          \
-                std::make_pair(-std::numeric_limits<double>::max(),      \
-                                std::numeric_limits<int>::max()))
+        : std::pair<double, int>                                           \
+        : omp_out = (omp_in.first > omp_out.first ? omp_out : omp_in))     \
+initializer (omp_priv =                                          \
+        std::make_pair(-std::numeric_limits<double>::max(),      \
+            std::numeric_limits<int>::max()))
 
 template <typename T>
 inline bool is_parallel(std::vector<T>& a, std::vector<T>& b) {
@@ -80,7 +80,7 @@ viterbi::viterbi(std::string &arg1, std::string& arg2) {
         rp = seq_len - 1;
 
     unsigned int offset = sizeof(unsigned int) * 2
-                        + sizeof(double) * (lp + 1) * num_hidden * num_hidden;
+        + sizeof(double) * (lp + 1) * num_hidden * num_hidden;
 
     // Allocate memory for data
     ltdp_matrix.resize(rp - lp);
@@ -98,7 +98,9 @@ viterbi::viterbi(std::string &arg1, std::string& arg2) {
     // Load LTDP matrix
     for (int i = 0; i < rp - lp; i++) {
 
+#ifdef WAVEFRONT
 #pragma omp parallel for default(shared)
+#endif
         for (int j = 0; j < num_hidden; j++) {
             for (int k = 0; k < num_hidden; k++) {
                 ltdp_matrix[i][j][k] =
@@ -140,12 +142,18 @@ void viterbi::decode() {
 
 #ifdef DEBUG
     std::cout << "Running algorithm for " << num_hidden
-              << " hidden states, and a sequence of length "
-              << seq_len << std::endl;
+        << " hidden states, and a sequence of length "
+        << seq_len << std::endl;
 #endif
 
-/* BEGIN LTDP PARALLEL VITERBI ALGORITHM
- */
+    /* BEGIN LTDP PARALLEL VITERBI ALGORITHM
+    */
+    // Time the execution
+    double start, end;
+
+    if (tid == 0)
+        start = MPI_Wtime();
+
 
 #ifdef DEBUG
     std::cout << "Forward pass: Thread "
@@ -170,11 +178,13 @@ void viterbi::decode() {
 
     for (int i = lp + 1; i <= rp; i++) {
 
+#ifdef WAVEFRONT
 #pragma omp parallel for default(shared)
+#endif
         for (int j = 0; j < num_hidden; j++) {
             std::pair<double, int> max_p = std::make_pair(
                     -std::numeric_limits<double>::max(),
-                     std::numeric_limits<int>::max());
+                    std::numeric_limits<int>::max());
             double entry;
 
             for (size_t k = 0; k < num_hidden; k++) {
@@ -212,19 +222,15 @@ void viterbi::decode() {
             + "\n";
 #endif
 
-        MPI_Request send_req;
-        MPI_Status send_stat;
-
         if (tid != num_procs - 1) {
-           // Send the solution vector to the next section
-            MPI_Isend(
+            // Send the solution vector to the next section
+            MPI_Send(
                     &dp1[rp - lp - 1].front(),
                     num_hidden,
                     MPI_DOUBLE,
                     tid + 1,
                     0,
-                    MPI_COMM_WORLD,
-                    &send_req);
+                    MPI_COMM_WORLD);
         }
 
         if (tid != 0) {
@@ -250,13 +256,15 @@ void viterbi::decode() {
 #endif
 
         if (tid != 0) {
-            for (int i = lp + 1; i < rp; i++) {
+            for (int i = lp + 1; i <= rp; i++) {
 
+#ifdef WAVEFRONT
 #pragma omp parallel for default(shared)
+#endif
                 for (int j = 0; j < num_hidden; j++) {
                     std::pair<double, int> max_p = std::make_pair(
                             -std::numeric_limits<double>::max(),
-                             std::numeric_limits<int>::max());
+                            std::numeric_limits<int>::max());
                     double entry;
 
                     for (size_t k = 0; k < num_hidden; k++) {
@@ -282,38 +290,6 @@ void viterbi::decode() {
 
                 dp1[i - lp - 1] = s;
             }
-
-            MPI_Wait(&send_req, &send_stat);
-
-#pragma omp parallel for default(shared)
-            for (int j = 0; j < num_hidden; j++) {
-                std::pair<double, int> max_p = std::make_pair(
-                        -std::numeric_limits<double>::max(),
-                         std::numeric_limits<int>::max());
-                double entry;
-
-                for (size_t k = 0; k < num_hidden; k++) {
-                    entry = s[k] + ltdp_matrix[rp - lp - 1][j][k];
-
-                    if (entry > max_p.first) {
-                        max_p.first = entry;
-                        max_p.second = k;
-                    }
-                }
-
-                next_s[j] = max_p.first;
-
-                dp2[rp - lp - 1][j] = max_p.second;
-            }
-
-            s = next_s;
-
-            if (is_parallel(s, dp1[rp - lp - 1])) {
-                conv = 0b1;
-                break;
-            }
-
-            dp1[rp - lp - 1] = s;
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -369,28 +345,24 @@ void viterbi::decode() {
         unsigned int x;
 
 #ifdef DEBUG
-    std::cout << "Backward fix up loop: Thread "
-        + std::to_string(tid)
-        + " running from "
-        + std::to_string(rp)
-        + " to "
-        + std::to_string(lp + 1)
-        + "\n";
+        std::cout << "Backward fix up loop: Thread "
+            + std::to_string(tid)
+            + " running from "
+            + std::to_string(rp)
+            + " to "
+            + std::to_string(lp + 1)
+            + "\n";
 #endif
-
-        MPI_Status send_stat;
-        MPI_Request send_req;
 
         if (tid != 0) {
             // Send the result value to the previous section
-            MPI_Isend(
+            MPI_Send(
                     &predicted_sequence[0],
                     1,
                     MPI_UNSIGNED,
                     tid - 1,
                     0,
-                    MPI_COMM_WORLD,
-                    &send_req);
+                    MPI_COMM_WORLD);
         }
         if (tid != num_procs - 1) {
             conv = 0b0;
@@ -407,6 +379,14 @@ void viterbi::decode() {
 
         }
 
+#ifdef DEBUG
+        std::cout << "Backward fix up loop: Thread "
+            + std::to_string(tid)
+            + "/"
+            + std::to_string(num_procs)+
+            + " finished communication.\n";
+#endif
+
         if (tid != num_procs - 1) {
             for (int i = rp; i >= lp + 1; i--) {
                 x = dp2[i - lp - 1][x];
@@ -418,25 +398,39 @@ void viterbi::decode() {
 
                 predicted_sequence[i - lp - 1] = x;
             }
-
-            MPI_Wait(&send_req, &send_stat);
-
-            x = dp2[0][x];
-
-            if (predicted_sequence[0] == x) {
-                conv = 0b1;
-                break;
-            }
-
-            predicted_sequence[0] = x;
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
 
+#ifdef DEBUG
+        std::cout << "Backward fix up loop: Thread "
+            + std::to_string(tid)
+            + " finished backward pass.\n";
+#endif
+
         // Get the global value of conv
         MPI_Allreduce(&conv, &global_conv, 1, MPI_BYTE, MPI_LAND, MPI_COMM_WORLD);
 
+#ifdef DEBUG
+        std::cout << "Backward fix up loop: Thread "
+            + std::to_string(tid)
+            + " sent value of conv as "
+            + (conv ? "true" : "false")
+            + " and recieved global conv as "
+            + (global_conv ? "true" : "false")
+            + "\n";
+#endif
+
     } while (!global_conv);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (tid == 0) {
+        end = MPI_Wtime();
+        std::cout << "Total time elapsed: "
+            << end - start
+            << std::endl;
+    }
 
     MPI_Finalize();
 }

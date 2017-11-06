@@ -69,6 +69,8 @@ void viterbi::decode() {
               << seq_len << std::endl;
 #endif
 
+    auto wcts = std::chrono::system_clock::now();
+
     // Algorithm
     std::vector<double> s(num_hidden, 0.0);
 
@@ -100,6 +102,13 @@ void viterbi::decode() {
         predicted_sequence[i] = dp2[i][x];
         x = predicted_sequence[i];
     }
+
+    std::chrono::duration<double> wctduration = (std::chrono::system_clock::now() - wcts);
+    std::cout << "Elapsed time: "
+              << wctduration.count()
+              << " seconds."
+              << std::endl;
+
 }
 
 void viterbi::show_predicted() {
